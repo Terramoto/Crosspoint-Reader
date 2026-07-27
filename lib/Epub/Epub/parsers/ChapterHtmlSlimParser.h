@@ -53,6 +53,7 @@ class ChapterHtmlSlimParser {
   std::string contentBase;
   std::string imageBasePath;
   int imageCounter = 0;
+  uint32_t nextSourceBlockOrdinal = 0;
 
   // Style tracking (replaces depth-based approach)
   struct StyleStackEntry {

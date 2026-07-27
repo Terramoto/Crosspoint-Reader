@@ -61,6 +61,7 @@ class ActivityManager {
   // Whether to trigger a render after the current loop()
   // This variable must only be set by the main loop, to avoid race conditions
   bool requestedUpdate = false;
+  bool notificationStandbyRequested = false;
 
  public:
   explicit ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput)
@@ -98,6 +99,11 @@ class ActivityManager {
   bool preventAutoSleep() const;
   bool isReaderActivity() const;
   bool skipLoopDelay() const;
+
+  // Request/consume the home-menu Sleep action. The main
+  // loop owns the actual sleep preparation and hardware transition.
+  void requestNotificationStandby();
+  bool takeNotificationStandbyRequest();
 
   // If immediate is true, the update will be triggered immediately.
   // Otherwise, it will be deferred until the end of the current loop iteration.

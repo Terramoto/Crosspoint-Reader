@@ -5,6 +5,7 @@
 #include <HalStorage.h>
 #include <I18n.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -517,11 +518,17 @@ void LyraTheme::drawEmptyRecents(const GfxRenderer& renderer, const Rect rect) c
 void LyraTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                                const std::function<std::string(int index)>& buttonLabel,
                                const std::function<UIIcon(int index)>& rowIcon) const {
-  for (int i = 0; i < buttonCount; ++i) {
+  const int rowStride = LyraMetrics::values.menuRowHeight + LyraMetrics::values.menuSpacing;
+  const int visibleCount = std::max(1, (rect.height + LyraMetrics::values.menuSpacing) / rowStride);
+  const int pageStart = selectedIndex >= 0 ? (selectedIndex / visibleCount) * visibleCount : 0;
+  const int pageEnd = std::min(buttonCount, pageStart + visibleCount);
+
+  for (int i = pageStart; i < pageEnd; ++i) {
+    const int visibleIndex = i - pageStart;
     int tileWidth = rect.width - LyraMetrics::values.contentSidePadding * 2;
     Rect tileRect = Rect{rect.x + LyraMetrics::values.contentSidePadding,
-                         rect.y + i * (LyraMetrics::values.menuRowHeight + LyraMetrics::values.menuSpacing), tileWidth,
-                         LyraMetrics::values.menuRowHeight};
+                         rect.y + visibleIndex * (LyraMetrics::values.menuRowHeight + LyraMetrics::values.menuSpacing),
+                         tileWidth, LyraMetrics::values.menuRowHeight};
 
     const bool selected = selectedIndex == i;
 

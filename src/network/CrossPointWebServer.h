@@ -34,6 +34,7 @@ class CrossPointWebServer {
     FsFile file;
     String fileName;
     String path = "/";
+    String sha256;
     size_t size = 0;
     bool success = false;
     String error = "";
@@ -68,6 +69,12 @@ class CrossPointWebServer {
   // Get the port number
   uint16_t getPort() const { return port; }
 
+  // Restrict mutating/file API routes to a short-lived companion session.
+  void configureCompanionSession(std::string token);
+  bool companionReady() const { return companionClientReady; }
+  bool companionComplete() const { return companionClientComplete; }
+  bool companionRestartRequired() const { return companionClientRestartRequired; }
+
  private:
   std::unique_ptr<WebServer> server = nullptr;
   std::unique_ptr<WebSocketsServer> wsServer = nullptr;
@@ -77,6 +84,10 @@ class CrossPointWebServer {
   uint16_t wsPort = 81;  // WebSocket port
   NetworkUDP udp;
   bool udpActive = false;
+  std::string companionToken;
+  bool companionClientReady = false;
+  bool companionClientComplete = false;
+  mutable bool companionClientRestartRequired = false;
 
   // WebSocket upload state
   void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
@@ -100,6 +111,9 @@ class CrossPointWebServer {
   void handleRename() const;
   void handleMove() const;
   void handleDelete() const;
+  void handleCompanionReady();
+  void handleCompanionComplete();
+  bool authorizeCompanionRequest() const;
 
   // Settings handlers
   void handleSettingsPage() const;

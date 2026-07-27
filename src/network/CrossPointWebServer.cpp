@@ -1,6 +1,7 @@
 #include "CrossPointWebServer.h"
 
 #include <ArduinoJson.h>
+#include <BookIdentity.h>
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
+#include "RecentBooksStore.h"
 #include "SettingsList.h"
 #include "WebDAVHandler.h"
 #include "html/FilesPageHtml.generated.h"
@@ -88,6 +90,20 @@ CrossPointWebServer::CrossPointWebServer() {}
 
 CrossPointWebServer::~CrossPointWebServer() { stop(); }
 
+void CrossPointWebServer::configureCompanionSession(std::string token) {
+  companionToken = std::move(token);
+  companionClientReady = false;
+  companionClientComplete = false;
+  companionClientRestartRequired = false;
+}
+
+bool CrossPointWebServer::authorizeCompanionRequest() const {
+  if (companionToken.empty()) return true;
+  if (server->header("X-CrossPoint-Token") == companionToken.c_str()) return true;
+  server->send(401, "text/plain", "Invalid or missing companion session token");
+  return false;
+}
+
 void CrossPointWebServer::begin() {
   if (running) {
     LOG_DBG("WEB", "Web server already running");
@@ -133,50 +149,78 @@ void CrossPointWebServer::begin() {
   server->on("/files", HTTP_GET, [this] { handleFileList(); });
 
   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
-  server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
-  server->on("/download", HTTP_GET, [this] { handleDownload(); });
+  server->on("/api/files", HTTP_GET, [this] {
+    if (authorizeCompanionRequest()) handleFileListData();
+  });
+  server->on("/download", HTTP_GET, [this] {
+    if (authorizeCompanionRequest()) handleDownload();
+  });
 
   // Upload endpoint with special handling for multipart form data
-  server->on("/upload", HTTP_POST, [this] { handleUploadPost(upload); }, [this] { handleUpload(upload); });
+  server->on(
+      "/upload", HTTP_POST,
+      [this] {
+        if (authorizeCompanionRequest()) handleUploadPost(upload);
+      },
+      [this] { handleUpload(upload); });
 
   // Create folder endpoint
-  server->on("/mkdir", HTTP_POST, [this] { handleCreateFolder(); });
+  server->on("/mkdir", HTTP_POST, [this] {
+    if (authorizeCompanionRequest()) handleCreateFolder();
+  });
 
   // Rename file endpoint
-  server->on("/rename", HTTP_POST, [this] { handleRename(); });
+  server->on("/rename", HTTP_POST, [this] {
+    if (authorizeCompanionRequest()) handleRename();
+  });
 
   // Move file endpoint
-  server->on("/move", HTTP_POST, [this] { handleMove(); });
+  server->on("/move", HTTP_POST, [this] {
+    if (authorizeCompanionRequest()) handleMove();
+  });
 
   // Delete file/folder endpoint
-  server->on("/delete", HTTP_POST, [this] { handleDelete(); });
+  server->on("/delete", HTTP_POST, [this] {
+    if (authorizeCompanionRequest()) handleDelete();
+  });
+
+  server->on("/api/companion/ready", HTTP_POST, [this] { handleCompanionReady(); });
+  server->on("/api/companion/complete", HTTP_POST, [this] { handleCompanionComplete(); });
 
   // Settings endpoints
   server->on("/settings", HTTP_GET, [this] { handleSettingsPage(); });
   server->on("/api/settings", HTTP_GET, [this] { handleGetSettings(); });
-  server->on("/api/settings", HTTP_POST, [this] { handlePostSettings(); });
+  server->on("/api/settings", HTTP_POST, [this] {
+    if (authorizeCompanionRequest()) handlePostSettings();
+  });
 
   server->onNotFound([this] { handleNotFound(); });
   LOG_DBG("WEB", "[MEM] Free heap after route setup: %d bytes", ESP.getFreeHeap());
 
-  // Collect WebDAV headers and register handler
-  const char* davHeaders[] = {"Depth", "Destination", "Overwrite", "If", "Lock-Token", "Timeout"};
-  server->collectHeaders(davHeaders, 6);
-  server->addHandler(new WebDAVHandler());  // Note: WebDAVHandler will be deleted by WebServer when server is stopped
-  LOG_DBG("WEB", "WebDAV handler initialized");
+  // Collect headers used by the normal web UI and companion session.
+  const char* davHeaders[] = {"Depth", "Destination", "Overwrite", "If", "Lock-Token", "Timeout",
+                              "X-CrossPoint-Token"};
+  server->collectHeaders(davHeaders, 7);
+  if (companionToken.empty()) {
+    server->addHandler(new WebDAVHandler());  // Deleted by WebServer when stopped.
+    LOG_DBG("WEB", "WebDAV handler initialized");
+  }
 
   server->begin();
 
-  // Start WebSocket server for fast binary uploads
-  LOG_DBG("WEB", "Starting WebSocket server on port %d...", wsPort);
-  wsServer.reset(new WebSocketsServer(wsPort));
-  wsInstance = const_cast<CrossPointWebServer*>(this);
-  wsServer->begin();
-  wsServer->onEvent(wsEventCallback);
-  LOG_DBG("WEB", "WebSocket server started");
+  // The short-lived companion AP only needs authenticated HTTP. Avoid opening
+  // the unauthenticated WebSocket/WebDAV paths and save heap during transfers.
+  if (companionToken.empty()) {
+    LOG_DBG("WEB", "Starting WebSocket server on port %d...", wsPort);
+    wsServer.reset(new WebSocketsServer(wsPort));
+    wsInstance = const_cast<CrossPointWebServer*>(this);
+    wsServer->begin();
+    wsServer->onEvent(wsEventCallback);
+    LOG_DBG("WEB", "WebSocket server started");
 
-  udpActive = udp.begin(LOCAL_UDP_PORT);
-  LOG_DBG("WEB", "Discovery UDP %s on port %d", udpActive ? "enabled" : "failed", LOCAL_UDP_PORT);
+    udpActive = udp.begin(LOCAL_UDP_PORT);
+    LOG_DBG("WEB", "Discovery UDP %s on port %d", udpActive ? "enabled" : "failed", LOCAL_UDP_PORT);
+  }
 
   running = true;
 
@@ -184,7 +228,7 @@ void CrossPointWebServer::begin() {
   // Show the correct IP based on network mode
   const String ipAddr = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   LOG_DBG("WEB", "Access at http://%s/", ipAddr.c_str());
-  LOG_DBG("WEB", "WebSocket at ws://%s:%d/", ipAddr.c_str(), wsPort);
+  if (wsServer) LOG_DBG("WEB", "WebSocket at ws://%s:%d/", ipAddr.c_str(), wsPort);
   LOG_DBG("WEB", "[MEM] Free heap after server.begin(): %d bytes", ESP.getFreeHeap());
 }
 
@@ -548,6 +592,10 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
   const HTTPUpload& upload = server->upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    if (!authorizeCompanionRequest()) {
+      state.error = "Unauthorized companion upload";
+      return;
+    }
     // Reset watchdog - this is the critical 1% crash point
     esp_task_wdt_reset();
 
@@ -577,6 +625,7 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     } else {
       state.path = "/";
     }
+    state.sha256 = server->hasArg("sha256") ? server->arg("sha256") : "";
 
     LOG_DBG("WEB", "[UPLOAD] START: %s to path: %s", state.fileName.c_str(), state.path.c_str());
     LOG_DBG("WEB", "[UPLOAD] Free heap: %d bytes", ESP.getFreeHeap());
@@ -585,6 +634,7 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     String filePath = state.path;
     if (!filePath.endsWith("/")) filePath += "/";
     filePath += state.fileName;
+    BookIdentity::invalidate(filePath.c_str());
 
     // Check if file already exists - SD operations can be slow
     esp_task_wdt_reset();
@@ -664,6 +714,9 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
         if (!filePath.endsWith("/")) filePath += "/";
         filePath += state.fileName;
         clearEpubCacheIfNeeded(filePath);
+        if (BookIdentity::isSha256(state.sha256.c_str())) {
+          BookIdentity::remember(filePath.c_str(), state.sha256.c_str(), state.size);
+        }
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
@@ -679,6 +732,18 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     state.error = "Upload aborted";
     LOG_DBG("WEB", "Upload aborted");
   }
+}
+
+void CrossPointWebServer::handleCompanionReady() {
+  if (!authorizeCompanionRequest()) return;
+  companionClientReady = true;
+  server->send(200, "application/json", "{\"ready\":true}");
+}
+
+void CrossPointWebServer::handleCompanionComplete() {
+  if (!authorizeCompanionRequest()) return;
+  companionClientComplete = true;
+  server->send(200, "application/json", "{\"complete\":true}");
 }
 
 void CrossPointWebServer::handleUploadPost(UploadState& state) const {
@@ -726,7 +791,7 @@ void CrossPointWebServer::handleCreateFolder() const {
 
   // Check if already exists
   if (Storage.exists(folderPath.c_str())) {
-    server->send(400, "text/plain", "Folder already exists");
+    server->send(409, "text/plain", "Folder already exists");
     return;
   }
 
@@ -1007,6 +1072,10 @@ void CrossPointWebServer::handleDelete() const {
       if (f) f.close();
       success = Storage.remove(itemPath.c_str());
       clearEpubCacheIfNeeded(itemPath);
+      if (success && FsHelpers::hasEpubExtension(itemPath)) {
+        RECENT_BOOKS.removeBook(itemPath.c_str());
+        if (!companionToken.empty()) companionClientRestartRequired = true;
+      }
     }
 
     if (!success) {

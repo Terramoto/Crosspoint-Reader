@@ -1,7 +1,9 @@
 #pragma once
 #include <Epub.h>
 #include <Epub/FootnoteEntry.h>
+#include <Epub/Page.h>
 #include <Epub/Section.h>
+#include <AnnotationStore.h>
 
 #include "EpubReaderMenuActivity.h"
 #include "activities/Activity.h"
@@ -28,6 +30,18 @@ class EpubReaderActivity final : public Activity {
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
   bool automaticPageTurnActive = false;
 
+  std::unique_ptr<AnnotationStore> annotationStore;
+  std::vector<HighlightRecord> currentSpineHighlights;
+  std::vector<Page::SelectableWord> selectableWords;
+  bool selectionMode = false;
+  bool selectionAnchored = false;
+  int selectionPageDirection = 0;
+  int selectionStartPage = 0;
+  int selectionStartLine = 0;
+  size_t selectionCursor = 0;
+  SourcePoint selectionStart;
+  bool closeInProgress = false;
+
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
   struct SavedPosition {
@@ -48,6 +62,12 @@ class EpubReaderActivity final : public Activity {
   void applyOrientation(uint8_t orientation);
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
   void pageTurn(bool isForwardTurn);
+  bool handleSelectionInput();
+  void beginSelection();
+  void finishSelection();
+  void refreshSpineHighlights();
+  void closeBook(bool toFileBrowser);
+  std::string collectSelectedQuote(const SourcePoint& start, const SourcePoint& end, int firstPage, int lastPage);
 
   // Footnote navigation
   void navigateToHref(const std::string& href, bool savePosition = false);

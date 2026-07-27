@@ -223,6 +223,14 @@ bool ActivityManager::isReaderActivity() const { return currentActivity && curre
 
 bool ActivityManager::skipLoopDelay() const { return currentActivity && currentActivity->skipLoopDelay(); }
 
+void ActivityManager::requestNotificationStandby() { notificationStandbyRequested = true; }
+
+bool ActivityManager::takeNotificationStandbyRequest() {
+  const bool requested = notificationStandbyRequested;
+  notificationStandbyRequested = false;
+  return requested;
+}
+
 void ActivityManager::requestUpdate(bool immediate) {
   if (immediate) {
     if (renderTaskHandle) {

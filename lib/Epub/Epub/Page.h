@@ -1,5 +1,6 @@
 #pragma once
 #include <HalStorage.h>
+#include <AnnotationStore.h>
 
 #include <algorithm>
 #include <string>
@@ -57,6 +58,14 @@ class PageImage final : public PageElement {
 
 class Page {
  public:
+  struct SelectableWord {
+    std::string text;
+    SourceWordRange source;
+    int16_t x = 0;
+    int16_t y = 0;
+    int16_t width = 0;
+    int16_t height = 0;
+  };
   // the list of block index and line numbers on this page
   std::vector<std::shared_ptr<PageElement>> elements;
   std::vector<FootnoteEntry> footnotes;
@@ -72,7 +81,10 @@ class Page {
     footnotes.push_back(entry);
   }
 
-  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset,
+              const std::vector<HighlightRecord>* highlights = nullptr) const;
+  std::vector<SelectableWord> getSelectableWords(const GfxRenderer& renderer, int fontId, int xOffset,
+                                                  int yOffset) const;
   bool serialize(FsFile& file) const;
   static std::unique_ptr<Page> deserialize(FsFile& file);
 

@@ -1,7 +1,9 @@
 #include "ReaderActivity.h"
 
 #include <FsHelpers.h>
+#include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <I18n.h>
 
 #include "CrossPointSettings.h"
 #include "Epub.h"
@@ -12,6 +14,7 @@
 #include "XtcReaderActivity.h"
 #include "activities/util/BmpViewerActivity.h"
 #include "activities/util/FullScreenMessageActivity.h"
+#include "components/UITheme.h"
 
 std::string ReaderActivity::extractFolderPath(const std::string& filePath) {
   const auto lastSlash = filePath.find_last_of('/');
@@ -32,7 +35,7 @@ bool ReaderActivity::isBmpFile(const std::string& path) { return FsHelpers::hasB
 
 std::unique_ptr<Epub> ReaderActivity::loadEpub(const std::string& path) {
   if (!Storage.exists(path.c_str())) {
-    LOG_ERR("READER", "File does not exist: %s", path.c_str());
+    ESP_LOGE("READER", "File does not exist: %s", path.c_str());
     return nullptr;
   }
 
@@ -41,13 +44,22 @@ std::unique_ptr<Epub> ReaderActivity::loadEpub(const std::string& path) {
     return epub;
   }
 
-  LOG_ERR("READER", "Failed to load epub");
+  ESP_LOGW("READER", "Failed to load epub; clearing its cache and retrying once");
+  epub.reset();
+  Epub(path, "/.crosspoint").clearCache();
+
+  epub.reset(new Epub(path, "/.crosspoint"));
+  if (epub->load(true, SETTINGS.embeddedStyle == 0)) {
+    return epub;
+  }
+
+  ESP_LOGE("READER", "Failed to load epub after rebuilding its cache");
   return nullptr;
 }
 
 std::unique_ptr<Xtc> ReaderActivity::loadXtc(const std::string& path) {
   if (!Storage.exists(path.c_str())) {
-    LOG_ERR("READER", "File does not exist: %s", path.c_str());
+    ESP_LOGE("READER", "File does not exist: %s", path.c_str());
     return nullptr;
   }
 
@@ -56,13 +68,13 @@ std::unique_ptr<Xtc> ReaderActivity::loadXtc(const std::string& path) {
     return xtc;
   }
 
-  LOG_ERR("READER", "Failed to load XTC");
+  ESP_LOGE("READER", "Failed to load XTC");
   return nullptr;
 }
 
 std::unique_ptr<Txt> ReaderActivity::loadTxt(const std::string& path) {
   if (!Storage.exists(path.c_str())) {
-    LOG_ERR("READER", "File does not exist: %s", path.c_str());
+    ESP_LOGE("READER", "File does not exist: %s", path.c_str());
     return nullptr;
   }
 
@@ -71,7 +83,7 @@ std::unique_ptr<Txt> ReaderActivity::loadTxt(const std::string& path) {
     return txt;
   }
 
-  LOG_ERR("READER", "Failed to load TXT");
+  ESP_LOGE("READER", "Failed to load TXT");
   return nullptr;
 }
 
@@ -111,6 +123,7 @@ void ReaderActivity::onEnter() {
     return;
   }
 
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   currentBookPath = initialBookPath;
   if (isBmpFile(initialBookPath)) {
     onGoToBmpViewer(initialBookPath);
@@ -131,6 +144,8 @@ void ReaderActivity::onEnter() {
   } else {
     auto epub = loadEpub(initialBookPath);
     if (!epub) {
+      GUI.drawPopup(renderer, "Could not open book");
+      delay(1500);
       onGoBack();
       return;
     }

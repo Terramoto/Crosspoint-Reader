@@ -10,11 +10,15 @@
 #include <Logging.h>
 #include <esp_system.h>
 
+#include <climits>
+#include <cstdlib>
+
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "EpubReaderChapterSelectionActivity.h"
 #include "EpubReaderFootnotesActivity.h"
 #include "EpubReaderPercentSelectionActivity.h"
+#include "activities/network/CompanionSyncActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
 #include "MappedInputManager.h"
@@ -55,6 +59,13 @@ void EpubReaderActivity::onEnter() {
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
 
   epub->setupCacheDir();
+  std::string revision = epub->getPath();
+  const auto filenameStart = revision.find_last_of('/');
+  if (filenameStart != std::string::npos) revision = revision.substr(filenameStart + 1);
+  const auto extension = revision.rfind(".epub");
+  if (extension != std::string::npos) revision.resize(extension);
+  annotationStore = std::make_unique<AnnotationStore>(epub->getPath(), epub->getCachePath(), revision);
+  annotationStore->load();
 
   FsFile f;
   if (Storage.openFileForRead("ERS", epub->getCachePath() + "/progress.bin", f)) {
@@ -99,6 +110,7 @@ void EpubReaderActivity::onExit() {
   APP_STATE.readerActivityLoadCount = 0;
   APP_STATE.saveToFile();
   section.reset();
+  annotationStore.reset();
   epub.reset();
 }
 
@@ -108,6 +120,8 @@ void EpubReaderActivity::loop() {
     finish();
     return;
   }
+
+  if (selectionMode && handleSelectionInput()) return;
 
   if (automaticPageTurnActive) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) ||
@@ -161,7 +175,7 @@ void EpubReaderActivity::loop() {
 
   // Long press BACK (1s+) goes to file selection
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
-    activityManager.goToFileBrowser(epub ? epub->getPath() : "");
+    closeBook(true);
     return;
   }
 
@@ -172,7 +186,7 @@ void EpubReaderActivity::loop() {
       restoreSavedPosition();
       return;
     }
-    onGoHome();
+    closeBook(false);
     return;
   }
 
@@ -352,8 +366,24 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       requestUpdate();
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::HIGHLIGHT: {
+      beginSelection();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::COMPANION_SYNC: {
+      startActivityForResult(
+          std::make_unique<CompanionSyncActivity>(renderer, mappedInput, epub->getPath(), false, false),
+          [this](const ActivityResult&) {
+            if (annotationStore) {
+              annotationStore->load();
+              refreshSpineHighlights();
+            }
+            requestUpdate();
+          });
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::GO_HOME: {
-      onGoHome();
+      closeBook(false);
       return;
     }
     case EpubReaderMenuActivity::MenuAction::DELETE_CACHE: {
@@ -369,7 +399,7 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           saveProgress(backupSpine, backupPage, backupPageCount);
         }
       }
-      onGoHome();
+      closeBook(false);
       return;
     }
     case EpubReaderMenuActivity::MenuAction::SCREENSHOT: {
@@ -401,6 +431,211 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       }
       break;
     }
+  }
+}
+
+void EpubReaderActivity::beginSelection() {
+  if (selectableWords.empty()) {
+    requestUpdate();
+    return;
+  }
+  automaticPageTurnActive = false;
+  selectionMode = true;
+  selectionAnchored = false;
+  selectionCursor = 0;
+  selectionPageDirection = 0;
+  requestUpdate();
+}
+
+bool EpubReaderActivity::handleSelectionInput() {
+  if (!section || selectableWords.empty()) {
+    requestUpdate();
+    return true;
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (selectionAnchored) {
+      selectionAnchored = false;
+    } else {
+      selectionMode = false;
+    }
+    requestUpdate();
+    return true;
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+    if (selectionCursor > 0) selectionCursor--;
+    requestUpdate();
+    return true;
+  }
+  if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+    if (selectionCursor + 1 < selectableWords.size()) selectionCursor++;
+    requestUpdate();
+    return true;
+  }
+
+  const bool up = mappedInput.wasReleased(MappedInputManager::Button::Up);
+  const bool down = mappedInput.wasReleased(MappedInputManager::Button::Down);
+  if (up || down) {
+    if (mappedInput.getHeldTime() >= 700) {
+      if (down && section->currentPage < section->pageCount - 1) {
+        section->currentPage++;
+        selectionPageDirection = 1;
+      } else if (up && section->currentPage > 0) {
+        section->currentPage--;
+        selectionPageDirection = -1;
+      }
+    } else {
+      const int currentY = selectableWords[selectionCursor].y;
+      size_t best = selectionCursor;
+      int bestDistance = INT_MAX;
+      for (size_t i = 0; i < selectableWords.size(); i++) {
+        const int delta = selectableWords[i].y - currentY;
+        if ((down && delta > 0) || (up && delta < 0)) {
+          const int distance = abs(delta) * 1000 + abs(selectableWords[i].x - selectableWords[selectionCursor].x);
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            best = i;
+          }
+        }
+      }
+      selectionCursor = best;
+    }
+    requestUpdate();
+    return true;
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (!selectionAnchored) {
+      const auto& word = selectableWords[selectionCursor];
+      selectionStart = {word.source.blockOrdinal, word.source.startOffset};
+      selectionStartPage = section->currentPage;
+      selectionStartLine = 1;
+      for (size_t index = 1; index <= selectionCursor; index++) {
+        if (selectableWords[index].y != selectableWords[index - 1].y) selectionStartLine++;
+      }
+      selectionAnchored = true;
+      requestUpdate();
+    } else {
+      finishSelection();
+    }
+    return true;
+  }
+  return true;
+}
+
+void EpubReaderActivity::finishSelection() {
+  if (!annotationStore || selectableWords.empty()) return;
+  const auto& word = selectableWords[selectionCursor];
+  SourcePoint end{word.source.blockOrdinal, word.source.endOffset};
+  SourcePoint start = selectionStart;
+  int firstPage = selectionStartPage;
+  int lastPage = section->currentPage;
+  int firstLine = selectionStartLine;
+  int lastLine = 1;
+  for (size_t index = 1; index <= selectionCursor; index++) {
+    if (selectableWords[index].y != selectableWords[index - 1].y) lastLine++;
+  }
+  const auto less = [](const SourcePoint& left, const SourcePoint& right) {
+    return left.blockOrdinal < right.blockOrdinal ||
+           (left.blockOrdinal == right.blockOrdinal && left.offset < right.offset);
+  };
+  if (less(end, start)) {
+    std::swap(start, end);
+    std::swap(firstPage, lastPage);
+    std::swap(firstLine, lastLine);
+  }
+
+  const auto existing = std::find_if(
+      currentSpineHighlights.begin(), currentSpineHighlights.end(), [&start, &end](const HighlightRecord& item) {
+        return !item.deleted && item.start.blockOrdinal == start.blockOrdinal && item.start.offset == start.offset &&
+               item.end.blockOrdinal == end.blockOrdinal && item.end.offset == end.offset;
+      });
+  if (existing != currentSpineHighlights.end()) {
+    annotationStore->remove(existing->id);
+    refreshSpineHighlights();
+    selectionMode = false;
+    selectionAnchored = false;
+    requestUpdate(true);
+    return;
+  }
+
+  HighlightRecord highlight;
+  highlight.spineHref = epub->getSpineItem(currentSpineIndex).href;
+  highlight.start = start;
+  highlight.end = end;
+  highlight.page = static_cast<uint32_t>(firstPage + 1);
+  highlight.line = static_cast<uint32_t>(std::max(1, firstLine));
+  highlight.quote = collectSelectedQuote(start, end, firstPage, lastPage);
+  if (!highlight.quote.empty() && highlight.quote.size() <= 8192 && annotationStore->add(std::move(highlight))) {
+    refreshSpineHighlights();
+  }
+  selectionMode = false;
+  selectionAnchored = false;
+  requestUpdate(true);
+}
+
+void EpubReaderActivity::closeBook(const bool toFileBrowser) {
+  if (closeInProgress || !epub) return;
+  closeInProgress = true;
+  const std::string path = epub->getPath();
+  if (section) {
+    nextPageNumber = section->currentPage;
+    RenderLock lock(*this);
+    section.reset();
+  }
+  selectableWords.clear();
+  currentPageFootnotes.clear();
+  currentSpineHighlights.clear();
+  startActivityForResult(
+      std::make_unique<CompanionSyncActivity>(renderer, mappedInput, path, true, false),
+      [this, path, toFileBrowser](const ActivityResult&) {
+        if (toFileBrowser) {
+          activityManager.goToFileBrowser(path);
+        } else {
+          onGoHome();
+        }
+      });
+}
+
+std::string EpubReaderActivity::collectSelectedQuote(const SourcePoint& start, const SourcePoint& end,
+                                                     const int firstPage, const int lastPage) {
+  if (!section) return {};
+  std::string quote;
+  const int savedPage = section->currentPage;
+  const int lowPage = std::max(0, std::min(firstPage, lastPage));
+  const int highPage = std::min<int>(section->pageCount - 1, std::max(firstPage, lastPage));
+  RenderLock lock(*this);
+  for (int pageNumber = lowPage; pageNumber <= highPage && quote.size() <= 8192; pageNumber++) {
+    section->currentPage = pageNumber;
+    auto page = section->loadPageFromSectionFile();
+    if (!page) continue;
+    for (const auto& element : page->elements) {
+      if (element->getTag() != TAG_PageLine) continue;
+      const auto& block = static_cast<const PageLine&>(*element).getBlock();
+      if (!block) continue;
+      const auto& words = block->getWords();
+      const auto& ranges = block->getSourceRanges();
+      for (size_t i = 0; i < words.size() && i < ranges.size(); i++) {
+        const auto& range = ranges[i];
+        if (range.blockOrdinal < start.blockOrdinal || range.blockOrdinal > end.blockOrdinal) continue;
+        if (range.blockOrdinal == start.blockOrdinal && range.endOffset <= start.offset) continue;
+        if (range.blockOrdinal == end.blockOrdinal && range.startOffset >= end.offset) continue;
+        if (!quote.empty()) quote.push_back(' ');
+        quote += words[i];
+        if (quote.size() > 8192) break;
+      }
+    }
+  }
+  section->currentPage = savedPage;
+  if (quote.size() > 8192) quote.resize(8192);
+  return quote;
+}
+
+void EpubReaderActivity::refreshSpineHighlights() {
+  currentSpineHighlights.clear();
+  if (annotationStore && epub && currentSpineIndex >= 0 && currentSpineIndex < epub->getSpineItemsCount()) {
+    currentSpineHighlights = annotationStore->forSpine(epub->getSpineItem(currentSpineIndex).href);
   }
 }
 
@@ -630,6 +865,20 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
     // Collect footnotes from the loaded page
     currentPageFootnotes = std::move(p->footnotes);
+    refreshSpineHighlights();
+    selectableWords = p->getSelectableWords(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+    if (!selectableWords.empty()) {
+      if (selectionPageDirection > 0) {
+        selectionCursor = 0;
+      } else if (selectionPageDirection < 0) {
+        selectionCursor = selectableWords.size() - 1;
+      } else if (selectionCursor >= selectableWords.size()) {
+        selectionCursor = selectableWords.size() - 1;
+      }
+    } else {
+      selectionCursor = 0;
+    }
+    selectionPageDirection = 0;
 
     const auto start = millis();
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
@@ -667,10 +916,26 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   auto* fcm = renderer.getFontCacheManager();
   fcm->resetStats();
 
+  std::vector<HighlightRecord> displayHighlights = currentSpineHighlights;
+  if (selectionMode && !selectableWords.empty() && selectionCursor < selectableWords.size()) {
+    const auto& cursorWord = selectableWords[selectionCursor];
+    HighlightRecord active;
+    active.spineHref = epub->getSpineItem(currentSpineIndex).href;
+    active.start = selectionAnchored ? selectionStart
+                                     : SourcePoint{cursorWord.source.blockOrdinal, cursorWord.source.startOffset};
+    active.end = {cursorWord.source.blockOrdinal, cursorWord.source.endOffset};
+    if (active.end.blockOrdinal < active.start.blockOrdinal ||
+        (active.end.blockOrdinal == active.start.blockOrdinal && active.end.offset < active.start.offset)) {
+      std::swap(active.start, active.end);
+    }
+    displayHighlights.push_back(std::move(active));
+  }
+
   // Font prewarm: scan pass accumulates text, then prewarm, then real render
   const uint32_t heapBefore = esp_get_free_heap_size();
   auto scope = fcm->createPrewarmScope();
-  page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);  // scan pass
+  page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
+               &displayHighlights);  // scan pass
   scope.endScanAndPrewarm();
   const uint32_t heapAfter = esp_get_free_heap_size();
   fcm->logStats("prewarm");
@@ -682,7 +947,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   // Force special handling for pages with images when anti-aliasing is on
   bool imagePageWithAA = page->hasImages() && SETTINGS.textAntiAliasing;
 
-  page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+  page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, &displayHighlights);
   renderStatusBar();
   fcm->logStats("bw_render");
   const auto tBwRender = millis();
@@ -699,7 +964,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 
       // Re-render page content to restore images into the blanked area
-      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, &displayHighlights);
       renderStatusBar();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     } else {
@@ -720,14 +985,14 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   if (SETTINGS.textAntiAliasing) {
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-    page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+    page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, &displayHighlights);
     renderer.copyGrayscaleLsbBuffers();
     const auto tGrayLsb = millis();
 
     // Render and copy to MSB buffer
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-    page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+    page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, &displayHighlights);
     renderer.copyGrayscaleMsbBuffers();
     const auto tGrayMsb = millis();
 

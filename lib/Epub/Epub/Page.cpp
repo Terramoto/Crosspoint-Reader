@@ -1,5 +1,6 @@
 #include "Page.h"
 
+#include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
 
@@ -48,10 +49,64 @@ std::unique_ptr<PageImage> PageImage::deserialize(FsFile& file) {
   return std::unique_ptr<PageImage>(new PageImage(std::move(ib), xPos, yPos));
 }
 
-void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
+namespace {
+bool wordIsHighlighted(const SourceWordRange& word, const HighlightRecord& highlight) {
+  if (word.blockOrdinal == UINT32_MAX || highlight.deleted) return false;
+  if (word.blockOrdinal < highlight.start.blockOrdinal || word.blockOrdinal > highlight.end.blockOrdinal) return false;
+  if (word.blockOrdinal == highlight.start.blockOrdinal && word.endOffset <= highlight.start.offset) return false;
+  if (word.blockOrdinal == highlight.end.blockOrdinal && word.startOffset >= highlight.end.offset) return false;
+  return true;
+}
+}  // namespace
+
+void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                  const std::vector<HighlightRecord>* highlights) const {
+  if (highlights && !highlights->empty()) {
+    for (const auto& element : elements) {
+      if (element->getTag() != TAG_PageLine) continue;
+      const auto& line = static_cast<const PageLine&>(*element);
+      const auto& block = line.getBlock();
+      if (!block) continue;
+      const auto& words = block->getWords();
+      const auto& positions = block->getWordXPositions();
+      const auto& styles = block->getWordStyles();
+      const auto& ranges = block->getSourceRanges();
+      for (size_t i = 0; i < words.size() && i < positions.size() && i < styles.size() && i < ranges.size(); i++) {
+        const bool selected = std::any_of(highlights->begin(), highlights->end(),
+                                          [&ranges, i](const auto& value) { return wordIsHighlighted(ranges[i], value); });
+        if (!selected) continue;
+        const int width = renderer.getTextAdvanceX(fontId, words[i].c_str(), styles[i]);
+        renderer.fillRectDither(line.xPos + positions[i] + xOffset - 1, line.yPos + yOffset, width + 2,
+                                renderer.getLineHeight(fontId), Color::LightGray);
+      }
+    }
+  }
   for (auto& element : elements) {
     element->render(renderer, fontId, xOffset, yOffset);
   }
+}
+
+std::vector<Page::SelectableWord> Page::getSelectableWords(const GfxRenderer& renderer, const int fontId,
+                                                            const int xOffset, const int yOffset) const {
+  std::vector<SelectableWord> result;
+  for (const auto& element : elements) {
+    if (element->getTag() != TAG_PageLine) continue;
+    const auto& line = static_cast<const PageLine&>(*element);
+    const auto& block = line.getBlock();
+    if (!block) continue;
+    const auto& words = block->getWords();
+    const auto& positions = block->getWordXPositions();
+    const auto& styles = block->getWordStyles();
+    const auto& ranges = block->getSourceRanges();
+    for (size_t i = 0; i < words.size() && i < positions.size() && i < styles.size() && i < ranges.size(); i++) {
+      if (ranges[i].blockOrdinal == UINT32_MAX) continue;
+      result.push_back({words[i], ranges[i], static_cast<int16_t>(line.xPos + positions[i] + xOffset),
+                        static_cast<int16_t>(line.yPos + yOffset),
+                        static_cast<int16_t>(renderer.getTextAdvanceX(fontId, words[i].c_str(), styles[i])),
+                        static_cast<int16_t>(renderer.getLineHeight(fontId))});
+    }
+  }
+  return result;
 }
 
 bool Page::serialize(FsFile& file) const {

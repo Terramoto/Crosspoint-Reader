@@ -5,6 +5,7 @@
 #include <HalStorage.h>
 #include <Logging.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
@@ -570,9 +571,16 @@ void BaseTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const std:
 void BaseTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                                const std::function<std::string(int index)>& buttonLabel,
                                const std::function<UIIcon(int index)>& rowIcon) const {
-  for (int i = 0; i < buttonCount; ++i) {
+  const int rowStride = BaseMetrics::values.menuRowHeight + BaseMetrics::values.menuSpacing;
+  const int availableHeight = std::max(0, rect.height - BaseMetrics::values.verticalSpacing);
+  const int visibleCount = std::max(1, (availableHeight + BaseMetrics::values.menuSpacing) / rowStride);
+  const int pageStart = selectedIndex >= 0 ? (selectedIndex / visibleCount) * visibleCount : 0;
+  const int pageEnd = std::min(buttonCount, pageStart + visibleCount);
+
+  for (int i = pageStart; i < pageEnd; ++i) {
+    const int visibleIndex = i - pageStart;
     const int tileY = BaseMetrics::values.verticalSpacing + rect.y +
-                      static_cast<int>(i) * (BaseMetrics::values.menuRowHeight + BaseMetrics::values.menuSpacing);
+                      visibleIndex * (BaseMetrics::values.menuRowHeight + BaseMetrics::values.menuSpacing);
 
     const bool selected = selectedIndex == i;
 

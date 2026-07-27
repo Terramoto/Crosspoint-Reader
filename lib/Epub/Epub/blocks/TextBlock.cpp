@@ -42,7 +42,7 @@ void TextBlock::render(const GfxRenderer& renderer, const int fontId, const int 
 }
 
 bool TextBlock::serialize(FsFile& file) const {
-  if (words.size() != wordXpos.size() || words.size() != wordStyles.size()) {
+  if (words.size() != wordXpos.size() || words.size() != wordStyles.size() || words.size() != sourceRanges.size()) {
     LOG_ERR("TXB", "Serialization failed: size mismatch (words=%u, xpos=%u, styles=%u)\n", words.size(),
             wordXpos.size(), wordStyles.size());
     return false;
@@ -53,6 +53,11 @@ bool TextBlock::serialize(FsFile& file) const {
   for (const auto& w : words) serialization::writeString(file, w);
   for (auto x : wordXpos) serialization::writePod(file, x);
   for (auto s : wordStyles) serialization::writePod(file, s);
+  for (const auto& range : sourceRanges) {
+    serialization::writePod(file, range.blockOrdinal);
+    serialization::writePod(file, range.startOffset);
+    serialization::writePod(file, range.endOffset);
+  }
 
   // Style (alignment + margins/padding/indent)
   serialization::writePod(file, blockStyle.alignment);
@@ -76,6 +81,7 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
   std::vector<std::string> words;
   std::vector<int16_t> wordXpos;
   std::vector<EpdFontFamily::Style> wordStyles;
+  std::vector<SourceWordRange> sourceRanges;
   BlockStyle blockStyle;
 
   // Word count
@@ -91,9 +97,15 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
   words.resize(wc);
   wordXpos.resize(wc);
   wordStyles.resize(wc);
+  sourceRanges.resize(wc);
   for (auto& w : words) serialization::readString(file, w);
   for (auto& x : wordXpos) serialization::readPod(file, x);
   for (auto& s : wordStyles) serialization::readPod(file, s);
+  for (auto& range : sourceRanges) {
+    serialization::readPod(file, range.blockOrdinal);
+    serialization::readPod(file, range.startOffset);
+    serialization::readPod(file, range.endOffset);
+  }
 
   // Style (alignment + margins/padding/indent)
   serialization::readPod(file, blockStyle.alignment);
@@ -109,6 +121,6 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
   serialization::readPod(file, blockStyle.textIndent);
   serialization::readPod(file, blockStyle.textIndentDefined);
 
-  return std::unique_ptr<TextBlock>(
-      new TextBlock(std::move(words), std::move(wordXpos), std::move(wordStyles), blockStyle));
+  return std::unique_ptr<TextBlock>(new TextBlock(std::move(words), std::move(wordXpos), std::move(wordStyles),
+                                                   std::move(sourceRanges), blockStyle));
 }

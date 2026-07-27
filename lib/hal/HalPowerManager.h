@@ -29,9 +29,14 @@ class HalPowerManager {
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
 
-  // Setup wake up GPIO and enter deep sleep
-  // Should be called inside main loop() to handle the currentLockMode
-  void startDeepSleep(HalGPIO& gpio) const;
+  // Fully power off the reader by releasing the GPIO13 battery latch.
+  void powerOff(HalGPIO& gpio) const;
+
+  // Keep the battery latch asserted and enter real ESP32 deep sleep. The
+  // power button and, when non-zero, the RTC timer can wake the reader.
+  void startNotificationStandby(HalGPIO& gpio, uint32_t timerSeconds) const;
+  int32_t getLastTimerArmResult() const;
+  uint32_t getLastArmedTimerSeconds() const;
 
   // Get battery percentage (range 0-100)
   uint16_t getBatteryPercentage() const;
@@ -53,4 +58,7 @@ class HalPowerManager {
     Lock(Lock&&) = delete;
     Lock& operator=(Lock&&) = delete;
   };
+
+ private:
+  void enterSleep(HalGPIO& gpio, bool keepPowerLatched, uint32_t timerSeconds) const;
 };

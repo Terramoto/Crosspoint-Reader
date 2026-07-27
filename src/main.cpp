@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <BleCompanionServer.h>
 #include <Epub.h>
 #include <FontCacheManager.h>
 #include <FontDecompressor.h>
@@ -10,10 +11,14 @@
 #include <HalSystem.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <PhoneNotificationStore.h>
 #include <SPI.h>
 #include <builtinFonts/all.h>
 
+#include <algorithm>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -128,6 +133,8 @@ EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
 unsigned long t1 = 0;
 unsigned long t2 = 0;
 
+void renderPhoneNotifications(const std::vector<PhoneNotification>& notifications);
+
 // Verify power button press duration on wake-up from deep sleep
 // Pre-condition: isWakeupByPowerButton() == true
 void verifyPowerButtonDuration() {
@@ -166,9 +173,8 @@ void verifyPowerButtonDuration() {
   }
 
   if (abort) {
-    // Button released too early. Returning to sleep.
-    // IMPORTANT: Re-arm the wakeup trigger before sleeping again
-    powerManager.startDeepSleep(gpio);
+    // Button released too early. Return to the original full-off state.
+    powerManager.powerOff(gpio);
   }
 }
 
@@ -180,19 +186,29 @@ void waitForPowerRelease() {
   }
 }
 
-// Enter deep sleep mode
-void enterDeepSleep() {
+void enterSleep(const bool notificationStandby) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
   APP_STATE.saveToFile();
 
-  activityManager.goToSleep();
+  if (notificationStandby) {
+    std::vector<PhoneNotification> cachedNotifications;
+    PhoneNotificationStore::load(cachedNotifications);
+    renderPhoneNotifications(cachedNotifications);
+  } else {
+    activityManager.goToSleep();
+  }
 
   display.deepSleep();
   LOG_DBG("MAIN", "Power button press calibration value: %lu ms", t2 - t1);
-  LOG_DBG("MAIN", "Entering deep sleep");
+  LOG_DBG("MAIN", "Entering %s", notificationStandby ? "notification standby" : "full power off");
 
-  powerManager.startDeepSleep(gpio);
+  if (notificationStandby) {
+    const uint8_t notificationMinutes = PhoneNotificationStore::loadPollMinutes();
+    powerManager.startNotificationStandby(gpio, static_cast<uint32_t>(notificationMinutes) * 60U);
+  } else {
+    powerManager.powerOff(gpio);
+  }
 }
 
 void setupDisplayAndFonts() {
@@ -226,6 +242,123 @@ void setupDisplayAndFonts() {
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
   LOG_DBG("MAIN", "Fonts setup");
+}
+
+void renderPhoneNotifications(const std::vector<PhoneNotification>& notifications) {
+  RenderLock lock;
+  const int width = renderer.getScreenWidth();
+  const int height = renderer.getScreenHeight();
+  constexpr int margin = 18;
+  constexpr int headerHeight = 54;
+  renderer.clearScreen();
+
+  if (notifications.empty()) {
+    renderer.drawCenteredText(UI_12_FONT_ID, height / 2, "No notifications", true, EpdFontFamily::BOLD);
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    return;
+  }
+
+  renderer.drawText(UI_12_FONT_ID, margin, 18, "Phone notifications", true, EpdFontFamily::BOLD);
+  renderer.drawLine(margin, headerHeight, width - margin, headerHeight);
+
+  const int count = std::min<int>(notifications.size(), 5);
+  const int itemHeight = count > 0 ? (height - headerHeight - 12) / count : height - headerHeight;
+  for (int index = 0; index < count; index++) {
+    const auto& item = notifications[index];
+    const int top = headerHeight + index * itemHeight + 10;
+    const int textWidth = width - margin * 2;
+    renderer.drawText(UI_10_FONT_ID, margin, top, item.app.c_str(), true, EpdFontFamily::BOLD);
+
+    std::string body = item.title;
+    if (!item.title.empty() && !item.text.empty()) body += " — ";
+    body += item.text;
+    const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+    const int maxLines = std::max(1, (itemHeight - lineHeight - 18) / lineHeight);
+    const auto lines = renderer.wrappedText(UI_10_FONT_ID, body.c_str(), textWidth, maxLines);
+    for (size_t line = 0; line < lines.size(); line++) {
+      renderer.drawText(UI_10_FONT_ID, margin, top + lineHeight * (line + 1), lines[line].c_str());
+    }
+    if (index + 1 < count) {
+      const int separatorY = headerHeight + (index + 1) * itemHeight;
+      renderer.drawLine(margin, separatorY, width - margin, separatorY);
+    }
+  }
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+}
+
+const char* wakeCauseName(const HalGPIO::WakeupReason wakeupReason) {
+  switch (wakeupReason) {
+    case HalGPIO::WakeupReason::PowerButton:
+      return "power_button";
+    case HalGPIO::WakeupReason::Timer:
+      return "timer";
+    case HalGPIO::WakeupReason::AfterFlash:
+      return "after_flash";
+    case HalGPIO::WakeupReason::AfterUSBPower:
+      return "after_usb_power";
+    case HalGPIO::WakeupReason::Other:
+    default:
+      return "other";
+  }
+}
+
+// Returns true only when Power was pressed during the polling window and the
+// caller should continue into a normal interactive boot.
+bool handleNotificationTimerWake() {
+  uint8_t pollMinutes = PhoneNotificationStore::loadPollMinutes();
+  if (pollMinutes == 0) {
+    powerManager.startNotificationStandby(gpio, 0);
+    return false;
+  }
+  std::vector<PhoneNotification> previous;
+  PhoneNotificationStore::load(previous);
+  BleCompanionServer ble;
+  bool pollStarted = false;
+  unsigned long lastRetry = 0;
+  const unsigned long startedAt = millis();
+  if (ble.begin()) {
+    while (millis() - startedAt < 30000) {
+      gpio.update();
+      if (gpio.isPressed(HalGPIO::BTN_POWER)) {
+        ble.stop();
+        return true;
+      }
+      ble.loop();
+      if (!pollStarted && ble.ready()) {
+        pollStarted = ble.startNotificationPoll(5);
+        lastRetry = millis();
+      } else if (pollStarted && !ble.notificationPollComplete() && millis() - lastRetry >= 1500) {
+        ble.retryNotificationPoll();
+        lastRetry = millis();
+      }
+      if (pollStarted && ble.notificationPollComplete()) break;
+      delay(20);
+    }
+  }
+
+  if (pollStarted && ble.notificationPollComplete()) {
+    delay(100);
+    const auto& received = ble.notifications();
+    if (!PhoneNotificationStore::equal(previous, received)) {
+      PhoneNotificationStore::save(received);
+      ble.stop();
+      setupDisplayAndFonts();
+      renderPhoneNotifications(received);
+      display.deepSleep();
+    } else {
+      ble.stop();
+    }
+  } else {
+    ble.stop();
+  }
+
+  pollMinutes = PhoneNotificationStore::loadPollMinutes();
+  if (pollMinutes > 0) {
+    powerManager.startNotificationStandby(gpio, static_cast<uint32_t>(pollMinutes) * 60U);
+  } else {
+    powerManager.startNotificationStandby(gpio, 0);
+  }
+  return false;
 }
 
 void setup() {
@@ -263,7 +396,11 @@ void setup() {
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
 
-  switch (gpio.getWakeupReason()) {
+  const auto wakeupReason = gpio.getWakeupReason();
+  PhoneNotificationStore::recordWakeDiagnostics(
+      wakeCauseName(wakeupReason), powerManager.getLastArmedTimerSeconds(),
+      powerManager.getLastTimerArmResult());
+  switch (wakeupReason) {
     case HalGPIO::WakeupReason::PowerButton:
       // For normal wakeups, verify power button press duration
       LOG_DBG("MAIN", "Verifying power button press duration");
@@ -272,7 +409,10 @@ void setup() {
     case HalGPIO::WakeupReason::AfterUSBPower:
       // If USB power caused a cold boot, go back to sleep
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
-      powerManager.startDeepSleep(gpio);
+      powerManager.powerOff(gpio);
+      break;
+    case HalGPIO::WakeupReason::Timer:
+      // Handled below; display/fonts are initialized only if content changed.
       break;
     case HalGPIO::WakeupReason::AfterFlash:
       // After flashing, just proceed to boot
@@ -283,6 +423,10 @@ void setup() {
 
   // First serial output only here to avoid timing inconsistencies for power button press duration verification
   LOG_DBG("MAIN", "Starting CrossPoint version " CROSSPOINT_VERSION);
+
+  if (wakeupReason == HalGPIO::WakeupReason::Timer && !handleNotificationTimerWake()) {
+    return;
+  }
 
   setupDisplayAndFonts();
 
@@ -363,9 +507,9 @@ void loop() {
 
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
   if (millis() - lastActivityTime >= sleepTimeoutMs) {
-    LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
-    enterDeepSleep();
-    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+    LOG_DBG("SLP", "Notification standby triggered after %lu ms of inactivity", sleepTimeoutMs);
+    enterSleep(true);
+    // This should never be hit because enterSleep() does not return.
     return;
   }
 
@@ -374,13 +518,17 @@ void loop() {
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
     }
-    enterDeepSleep();
-    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
+    enterSleep(false);
+    // This should never be hit because enterSleep() does not return.
     return;
   }
 
   const unsigned long activityStartTime = millis();
   activityManager.loop();
+  if (activityManager.takeNotificationStandbyRequest()) {
+    enterSleep(true);
+    return;
+  }
   const unsigned long activityDuration = millis() - activityStartTime;
 
   const unsigned long loopDuration = millis() - loopStartTime;

@@ -53,6 +53,14 @@ void RecentBooksStore::updateBook(const std::string& path, const std::string& ti
   }
 }
 
+bool RecentBooksStore::removeBook(const std::string& path) {
+  const auto oldSize = recentBooks.size();
+  recentBooks.erase(std::remove_if(recentBooks.begin(), recentBooks.end(),
+                                   [&path](const RecentBook& book) { return book.path == path; }),
+                    recentBooks.end());
+  return oldSize == recentBooks.size() || saveToFile();
+}
+
 bool RecentBooksStore::saveToFile() const {
   Storage.mkdir("/.crosspoint");
   return JsonSettingsIO::saveRecentBooks(*this, RECENT_BOOKS_FILE_JSON);

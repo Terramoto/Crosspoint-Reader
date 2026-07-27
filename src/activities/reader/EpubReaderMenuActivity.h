@@ -19,6 +19,8 @@ class EpubReaderMenuActivity final : public Activity {
     ROTATE_SCREEN,
     SCREENSHOT,
     DISPLAY_QR,
+    HIGHLIGHT,
+    COMPANION_SYNC,
     GO_HOME,
     SYNC,
     DELETE_CACHE

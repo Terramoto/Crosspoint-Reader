@@ -16,6 +16,9 @@ class ParsedText {
   std::vector<std::string> words;
   std::vector<EpdFontFamily::Style> wordStyles;
   std::vector<bool> wordContinues;  // true = word attaches to previous (no space before it)
+  std::vector<SourceWordRange> sourceRanges;
+  uint32_t sourceBlockOrdinal;
+  uint32_t nextSourceOffset = 0;
   BlockStyle blockStyle;
   bool extraParagraphSpacing;
   bool hyphenationEnabled;
@@ -35,8 +38,11 @@ class ParsedText {
 
  public:
   explicit ParsedText(const bool extraParagraphSpacing, const bool hyphenationEnabled = false,
-                      const BlockStyle& blockStyle = BlockStyle())
-      : blockStyle(blockStyle), extraParagraphSpacing(extraParagraphSpacing), hyphenationEnabled(hyphenationEnabled) {}
+                      const BlockStyle& blockStyle = BlockStyle(), const uint32_t sourceBlockOrdinal = UINT32_MAX)
+      : sourceBlockOrdinal(sourceBlockOrdinal),
+        blockStyle(blockStyle),
+        extraParagraphSpacing(extraParagraphSpacing),
+        hyphenationEnabled(hyphenationEnabled) {}
   ~ParsedText() = default;
 
   void addWord(std::string word, EpdFontFamily::Style fontStyle, bool underline = false, bool attachToPrevious = false);
