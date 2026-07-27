@@ -6,6 +6,29 @@ Built using **PlatformIO** and targeting the **ESP32-C3** microcontroller.
 CrossPoint Reader is a purpose-built firmware designed to be a drop-in, fully open-source replacement for the official 
 Xteink firmware. It aims to match or improve upon the standard EPUB reading experience.
 
+## What's different in this fork
+
+This fork adds an Android companion workflow while retaining the original CrossPoint reading experience:
+
+- **Companion-managed library:** Import EPUBs on Android and queue books to be added to or removed from the reader.
+  Bluetooth coordinates each session, while books are transferred over a temporary, authenticated WPA2 Wi-Fi hotspot.
+- **Durable highlights and notes:** Highlights are stored independently from disposable book-layout caches and
+  synchronize bidirectionally over Bluetooth. The companion displays page and line information, supports notes and
+  deletions, and restores matching highlight backups when a book is imported.
+- **Automatic exports beside each EPUB:** The companion saves readable Markdown and structured JSON highlight files
+  alongside the associated book whenever Android folder access has been granted.
+- **Background connectivity:** The Android foreground service can reconnect while the phone is locked, process queued
+  library changes, and synchronize annotations without requiring the app screen to remain open.
+- **Phone notifications during standby:** The reader can periodically wake, fetch active phone notifications over
+  Bluetooth, refresh the e-ink display only when they change, and return to deep sleep while leaving the last
+  notification screen visible.
+- **Separate Sleep and Power Off:** **Sleep** is available from the main menu and is also used by the configurable
+  inactivity timeout. It keeps the ESP32-C3 RTC available for notification polling. Holding the Power button retains
+  the original complete-shutdown behavior.
+
+See the [Android companion guide](./companion/android/README.md) for setup, pairing, library management, and highlight
+backup details.
+
 ![](./docs/images/cover.jpg)
 
 ## Motivation
